@@ -1,112 +1,41 @@
 const db = require('../config/db');
-const { sincronizarMembresiasVencidas } = require('../utils/syncMembresias');
 
-// Obtener todos los clientes con estado de membresía y entrenador
+// Obtener todos los clientes con estado de membresía y entrenador mediante función almacenada
 exports.getClientes = async (req, res) => {
   try {
-    // Sincronizar membresías vencidas antes de consultar
-    await sincronizarMembresiasVencidas();
-
     const { busqueda, estado } = req.query;
-    let queryText = `
-      SELECT 
-        c.idCliente,
-        c.Nombre,
-        c.Carnet,
-        c.Telefono,
-        c.Email,
-        c.Estado,
-        c.idEntrenador,
-        e.Nombre AS Entrenador_Nombre,
-        m.idMembresia,
-        p.Nombre_Plan,
-        m.Fecha_Inicio,
-        m.Fecha_Fin,
-        COALESCE(m.Estado, 'Sin Membresía') AS Estado_Membresia,
-        CASE 
-          WHEN m.Fecha_Fin IS NULL THEN 0
-          ELSE (m.Fecha_Fin - CURRENT_DATE)
-        END AS Dias_Restantes
-      FROM Cliente c
-      LEFT JOIN Entrenador e ON c.idEntrenador = e.idEntrenador
-      LEFT JOIN LATERAL (
-        SELECT idMembresia, idPlan, Fecha_Inicio, Fecha_Fin, Estado
-        FROM Membresia
-        WHERE idCliente = c.idCliente
-        ORDER BY Fecha_Fin DESC
-        LIMIT 1
-      ) m ON true
-      LEFT JOIN Planes p ON m.idPlan = p.idPlan
-      WHERE 1=1
-    `;
-    const params = [];
-
-    if (busqueda) {
-      params.push(`%${busqueda}%`);
-      queryText += ` AND (c.Nombre ILIKE $${params.length} OR c.Carnet ILIKE $${params.length})`;
-    }
-
-    if (estado) {
-      params.push(estado);
-      queryText += ` AND c.Estado = $${params.length}`;
-    }
-
-    queryText += ` ORDER BY c.idCliente DESC`;
-
-    const result = await db.query(queryText, params);
+    // La función fn_buscar_clientes consulta sobre la vista optimizada vw_clientes_detalle
+    // utilizando índices B-Tree en Carnet, Estado y LOWER(Nombre).
+    const result = await db.query(
+      'SELECT * FROM fn_buscar_clientes($1, $2)',
+      [busqueda || null, estado || null]
+    );
     res.json(result.rows);
   } catch (error) {
-    console.error('Error al obtener clientes:', error);
+    console.error('Error al obtener clientes vía función:', error);
     res.status(500).json({ error: 'Error al obtener clientes', details: error.message });
   }
 };
 
-// Obtener detalle de un cliente con su historial
+// Obtener detalle de un cliente con su historial mediante función analítica
 exports.getClienteById = async (req, res) => {
   const { id } = req.params;
   try {
-    const clienteRes = await db.query(
-      `SELECT c.*, e.Nombre AS Entrenador_Nombre 
-       FROM Cliente c 
-       LEFT JOIN Entrenador e ON c.idEntrenador = e.idEntrenador 
-       WHERE c.idCliente = $1`,
-      [id]
-    );
+    const result = await db.query('SELECT fn_obtener_cliente_detalle($1) AS data', [id]);
+    const data = result.rows[0]?.data;
 
-    if (clienteRes.rows.length === 0) {
+    if (!data || !data.cliente) {
       return res.status(404).json({ error: 'Cliente no encontrado' });
     }
 
-    const cliente = clienteRes.rows[0];
-
-    // Historial de membresías y pagos
-    const membresiasRes = await db.query(
-      `SELECT m.*, p.Nombre_Plan, p.Precio 
-       FROM Membresia m 
-       JOIN Planes p ON m.idPlan = p.idPlan 
-       WHERE m.idCliente = $1 
-       ORDER BY m.Fecha_Inicio DESC`,
-      [id]
-    );
-
-    // Historial de asistencias
-    const asistenciasRes = await db.query(
-      `SELECT * FROM Asistencia WHERE idCliente = $1 ORDER BY Fecha DESC, Hora DESC LIMIT 20`,
-      [id]
-    );
-
-    res.json({
-      cliente,
-      membresias: membresiasRes.rows,
-      asistencias: asistenciasRes.rows,
-    });
+    res.json(data);
   } catch (error) {
     console.error('Error al obtener detalle del cliente:', error);
     res.status(500).json({ error: 'Error al obtener cliente', details: error.message });
   }
 };
 
-// Registrar nuevo cliente
+// Registrar nuevo cliente mediante procedimiento almacenado
 exports.createCliente = async (req, res) => {
   const { Nombre, Carnet, Telefono, Email, idEntrenador } = req.body;
   try {
@@ -114,78 +43,67 @@ exports.createCliente = async (req, res) => {
       return res.status(400).json({ error: 'Nombre y Carnet son obligatorios' });
     }
 
-    const result = await db.query(
-      `INSERT INTO Cliente (Nombre, Carnet, Telefono, Email, Estado, idEntrenador)
-       VALUES ($1, $2, $3, $4, 'Activo', $5)
-       RETURNING *`,
+    // Invocar procedimiento almacenado para la inserción segura
+    const procRes = await db.query(
+      'CALL sp_crear_cliente($1, $2, $3, $4, $5, NULL)',
       [Nombre, Carnet, Telefono || null, Email || null, idEntrenador || null]
     );
 
-    res.status(201).json(result.rows[0]);
+    const newId = procRes.rows[0]?.p_id_cliente;
+
+    // Retornar la entidad consolidada desde la vista
+    const clienteRes = await db.query('SELECT * FROM vw_clientes_detalle WHERE idCliente = $1', [newId]);
+    res.status(201).json(clienteRes.rows[0] || { idCliente: newId });
   } catch (error) {
-    if (error.code === '23505') {
+    if (error.code === '23505' || (error.message && error.message.includes('Ya existe un cliente'))) {
       return res.status(400).json({ error: 'Ya existe un cliente con ese número de carnet' });
     }
-    console.error('Error al crear cliente:', error);
+    console.error('Error al crear cliente vía procedimiento:', error);
     res.status(500).json({ error: 'Error al registrar cliente', details: error.message });
   }
 };
 
-// Actualizar datos del cliente
+// Actualizar datos del cliente mediante procedimiento almacenado
 exports.updateCliente = async (req, res) => {
   const { id } = req.params;
+  const { Nombre, nombre, Carnet, carnet, Telefono, telefono, Email, email, idEntrenador, identrenador, Estado, estado } = req.body;
   try {
-    const fields = [];
-    const values = [];
-    let idx = 1;
+    const nombreVal = Nombre !== undefined ? Nombre : nombre;
+    const carnetVal = Carnet !== undefined ? Carnet : carnet;
+    const telefonoVal = Telefono !== undefined ? Telefono : telefono;
+    const emailVal = Email !== undefined ? Email : email;
+    const entrenadorVal = idEntrenador !== undefined ? idEntrenador : identrenador;
+    const estadoVal = Estado !== undefined ? Estado : estado;
 
-    const columnMapping = {
-      Nombre: 'Nombre',
-      nombre: 'Nombre',
-      Carnet: 'Carnet',
-      carnet: 'Carnet',
-      Telefono: 'Telefono',
-      telefono: 'Telefono',
-      Email: 'Email',
-      email: 'Email',
-      Estado: 'Estado',
-      estado: 'Estado',
-      idEntrenador: 'idEntrenador',
-      identrenador: 'idEntrenador',
-    };
+    await db.query(
+      'CALL sp_actualizar_cliente($1, $2, $3, $4, $5, $6, $7)',
+      [
+        id,
+        nombreVal !== undefined ? nombreVal : null,
+        carnetVal !== undefined ? carnetVal : null,
+        telefonoVal !== undefined ? telefonoVal : null,
+        emailVal !== undefined ? emailVal : null,
+        entrenadorVal !== undefined ? entrenadorVal : null,
+        estadoVal !== undefined ? estadoVal : null,
+      ]
+    );
 
-    const handledCols = new Set();
-    for (const [key, col] of Object.entries(columnMapping)) {
-      if (req.body[key] !== undefined && !handledCols.has(col)) {
-        fields.push(`${col} = $${idx++}`);
-        values.push(req.body[key]);
-        handledCols.add(col);
-      }
-    }
-
-    if (fields.length === 0) {
-      return res.status(400).json({ error: 'No se enviaron campos para actualizar' });
-    }
-
-    values.push(id);
-    const query = `UPDATE Cliente SET ${fields.join(', ')} WHERE idCliente = $${idx} RETURNING *`;
-    const result = await db.query(query, values);
-
-    if (result.rows.length === 0) {
+    const clienteRes = await db.query('SELECT * FROM vw_clientes_detalle WHERE idCliente = $1', [id]);
+    if (clienteRes.rows.length === 0) {
       return res.status(404).json({ error: 'Cliente no encontrado' });
     }
 
-    res.json(result.rows[0]);
+    res.json(clienteRes.rows[0]);
   } catch (error) {
-    if (error.code === '23505') {
+    if (error.code === '23505' || (error.message && error.message.includes('ya se encuentra registrado'))) {
       return res.status(400).json({ error: 'El carnet ingresado ya está asignado a otro cliente' });
     }
-    console.error('Error al actualizar cliente:', error);
+    console.error('Error al actualizar cliente vía procedimiento:', error);
     res.status(500).json({ error: 'Error al actualizar cliente', details: error.message });
   }
 };
 
-// Cambiar estado del cliente (Activo / Inactivo) con lógica de negocio
+// Cambiar estado del cliente (Activo / Inactivo) mediante procedimiento almacenado
 exports.updateEstado = async (req, res) => {
   const { id } = req.params;
   const { Estado } = req.body;
@@ -194,70 +112,46 @@ exports.updateEstado = async (req, res) => {
       return res.status(400).json({ error: 'Estado no válido. Debe ser Activo o Inactivo' });
     }
 
-    // Si se da de baja manualmente, inactivar sus membresías activas
-    if (Estado === 'Inactivo') {
-      await db.query(
-        `UPDATE Membresia SET Estado = 'Inactiva' WHERE idCliente = $1 AND Estado = 'Activa'`,
-        [id]
-      );
-    }
+    // El procedimiento sp_cambiar_estado_cliente dispara automáticamente los triggers:
+    // fn_trg_cliente_cambio_estado para inactivar membresías si se pasa a Inactivo
+    await db.query('CALL sp_cambiar_estado_cliente($1, $2)', [id, Estado]);
 
-    const result = await db.query(
-      `UPDATE Cliente SET Estado = $1 WHERE idCliente = $2 RETURNING *`,
-      [Estado, id]
-    );
-
-    if (result.rows.length === 0) {
+    const clienteRes = await db.query('SELECT * FROM vw_clientes_detalle WHERE idCliente = $1', [id]);
+    if (clienteRes.rows.length === 0) {
       return res.status(404).json({ error: 'Cliente no encontrado' });
     }
 
-    // Si se reactiva, verificar si tiene membresía vigente
+    const cliente = clienteRes.rows[0];
     let aviso = null;
-    if (Estado === 'Activo') {
-      const membresiaVigente = await db.query(
-        `SELECT idMembresia FROM Membresia 
-         WHERE idCliente = $1 AND Estado = 'Activa' AND Fecha_Fin >= CURRENT_DATE 
-         LIMIT 1`,
-        [id]
-      );
-      if (membresiaVigente.rows.length === 0) {
-        aviso = 'Cliente reactivado, pero no cuenta con membresía vigente. Requiere renovación para habilitar acceso.';
-      }
+    if (Estado === 'Activo' && (cliente.estado_membresia === 'Sin Membresía' || cliente.estado_membresia === 'Vencida' || cliente.dias_restantes < 0)) {
+      aviso = 'Cliente reactivado, pero no cuenta con membresía vigente. Requiere renovación para habilitar acceso.';
     }
 
     res.json({
       message: `Cliente ${Estado === 'Activo' ? 'reactivado' : 'dado de baja'} exitosamente`,
       aviso,
-      cliente: result.rows[0],
+      cliente,
     });
   } catch (error) {
-    console.error('Error al actualizar estado del cliente:', error);
+    console.error('Error al actualizar estado vía procedimiento:', error);
     res.status(500).json({ error: 'Error al actualizar estado del cliente', details: error.message });
   }
 };
 
-// Baja lógica del cliente (inactiva también sus membresías activas)
+// Baja lógica del cliente mediante procedimiento almacenado
 exports.deleteCliente = async (req, res) => {
   const { id } = req.params;
   try {
-    // Inactivar membresías activas del cliente
-    await db.query(
-      `UPDATE Membresia SET Estado = 'Inactiva' WHERE idCliente = $1 AND Estado = 'Activa'`,
-      [id]
-    );
+    await db.query('CALL sp_dar_baja_cliente($1)', [id]);
 
-    const result = await db.query(
-      `UPDATE Cliente SET Estado = 'Inactivo' WHERE idCliente = $1 RETURNING *`,
-      [id]
-    );
-
-    if (result.rows.length === 0) {
+    const clienteRes = await db.query('SELECT * FROM vw_clientes_detalle WHERE idCliente = $1', [id]);
+    if (clienteRes.rows.length === 0) {
       return res.status(404).json({ error: 'Cliente no encontrado' });
     }
 
-    res.json({ message: 'Cliente dado de baja exitosamente', cliente: result.rows[0] });
+    res.json({ message: 'Cliente dado de baja exitosamente', cliente: clienteRes.rows[0] });
   } catch (error) {
-    console.error('Error al dar de baja al cliente:', error);
+    console.error('Error al dar de baja al cliente vía procedimiento:', error);
     res.status(500).json({ error: 'Error al dar de baja al cliente', details: error.message });
   }
 };

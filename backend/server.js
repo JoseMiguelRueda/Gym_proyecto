@@ -51,6 +51,6 @@ app.listen(PORT, async () => {
     console.log(`✅ Conectado a PostgreSQL [BD: ${res.rows[0].current_database} | Usuario: ${res.rows[0].current_user}]`);
   } catch (err) {
     console.warn(`⚠️ Advertencia de conexión a BD: ${err.message}`);
-    console.warn(`👉 Recuerda crear la base de datos 'gym_db' y ejecutar 'database/schema_pgadmin4.sql' en pgAdmin 4.`);
+    console.warn(`👉 Recuerda crear la base de datos '${process.env.DB_NAME || 'db_gimnsaio'}' y ejecutar 'database/schema_pgadmin4.sql' en pgAdmin 4.`);
   }
 });
